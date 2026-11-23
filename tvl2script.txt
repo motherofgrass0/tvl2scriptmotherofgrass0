@@ -257,12 +257,15 @@ end)
 
 local mob = {
     on = false,
-    lock = false,
     tgt = nil,
     ch = nil,
     hrp = nil,
+    tap_tgt = nil,
+    last_tap = nil,
+    last_tap_t = 0,
+    cast_spoof_until = 0,
+    touch_over_ui = false,
     sg = nil,
-    aim_btn = nil,
     ping_btn = nil,
     priv_btn = nil,
     upd = nil,
@@ -693,14 +696,17 @@ end
 local function get_aim_target()
     if unloaded or not spawned or not hb_on then return nil end
     local t_name = (sel_plr ~= "None" and sel_plr) or cur_tgt
-    if not t_name or t_name == "None" then return nil end
+    if not t_name or t_name == "None" then
+        return (cur_tgt_ch and cur_tgt_ch.Parent) and cur_tgt_ch or nil
+    end
     local plr = plrs:FindFirstChild(t_name)
     local ch = plr and plr.Character
     if not (ch and ch.Parent) then
         local ent = ws:FindFirstChild("Entities")
         ch = ent and ent:FindFirstChild(t_name)
     end
-    return (ch and ch.Parent) and ch or nil
+    if ch and ch.Parent then return ch end
+    return (cur_tgt_ch and cur_tgt_ch.Parent) and cur_tgt_ch or nil
 end
 
 local patched = setmetatable({}, { __mode = "k" })
@@ -817,30 +823,40 @@ local MOUSE_HOLDER = { r = real_mouse }
 local mouse_isa = function(_, class)
     return class == "Mouse" or class == "Instance" or class == "Object"
 end
+local function get_spoof_screen_pos()
+    if unloaded or not spawned or not hb_on or not int_on then return nil end
+    local mob_casting = mob.on and not mob.touch_over_ui and (os.clock() <= mob.cast_spoof_until)
+    local pc_assist = (not mob.on) and (proj_casting or (proj_on and not over_ui_or_prompt()))
+    if not (proj_casting or mob_casting or pc_assist) then return nil end
+    local cur = get_aim_target()
+    if not cur then return nil end
+    local a = anchor(cur)
+    local c = ws.CurrentCamera
+    if not (a and c) then return nil end
+    local sp, on_s = c:WorldToViewportPoint(a.Position)
+    if mob.on and (not on_s or sp.Z <= 0) then return nil end
+    local inset = gui_svc:GetGuiInset()
+    return sp.X, sp.Y, sp.X - inset.X, sp.Y - inset.Y, a, c
+end
+
 local mouse_proxy = setmetatable({}, {
     __index = function(_, k)
         if k == "IsA" then return mouse_isa end
         if k == "ClassName" then return "Mouse" end
-        if proj_casting and not caller_is_engine() then
-            local cur = get_aim_target()
-            if cur then
-                local a = anchor(cur)
-                if a then
-                    local c = ws.CurrentCamera
-                    if k == "X" and c then
-                        local sp = c:WorldToViewportPoint(a.Position)
-                        return math.floor(sp.X)
-                    elseif k == "Y" and c then
-                        local sp = c:WorldToViewportPoint(a.Position)
-                        return math.floor(sp.Y)
-                    elseif k == "Hit" then
-                        return CFrame.new(a.Position)
-                    elseif k == "Target" then
-                        return a
-                    elseif k == "UnitRay" and c then
-                        local o = c.CFrame.Position
-                        return Ray.new(o, (a.Position - o).Unit)
-                    end
+        if not caller_is_engine() then
+            local sx, sy, _, _, a, c = get_spoof_screen_pos()
+            if sx and a then
+                if k == "X" then
+                    return math.floor(sx)
+                elseif k == "Y" then
+                    return math.floor(sy)
+                elseif k == "Hit" then
+                    return CFrame.new(a.Position)
+                elseif k == "Target" then
+                    return a
+                elseif k == "UnitRay" and c then
+                    local o = c.CFrame.Position
+                    return Ray.new(o, (a.Position - o).Unit)
                 end
             end
         end
@@ -873,11 +889,21 @@ end)
 
 do
     local function proj_target_pos()
-        if not proj_casting then return nil end
+        if unloaded or not spawned or not hb_on or not int_on then return nil end
+        local mob_casting = mob.on and not mob.touch_over_ui and (os.clock() <= mob.cast_spoof_until)
+        local pc_assist = (not mob.on) and (proj_casting or (proj_on and not over_ui_or_prompt()))
+        if not (proj_casting or mob_casting or pc_assist) then return nil end
         local cur = get_aim_target()
         if not cur then return nil end
         local a = anchor(cur)
         if not a then return nil end
+        if mob.on then
+            local c = ws.CurrentCamera
+            if c then
+                local sp, on_s = c:WorldToViewportPoint(a.Position)
+                if not on_s or sp.Z <= 0 then return nil end
+            end
+        end
         return a.Position, a
     end
     local old_namecall
@@ -887,9 +913,16 @@ do
             if method == "FireServer" or method == "fireServer" then return end
             if method == "InvokeServer" or method == "invokeServer" then return nil end
         end
-        if method == "ScreenPointToRay" or method == "ViewportPointToRay" then
+        if method == "GetMouseLocation" and self == uis then
+            if mob.on and not caller_is_engine() then
+                local sx, sy = get_spoof_screen_pos()
+                if sx and sy then
+                    return Vector2.new(sx, sy)
+                end
+            end
+        elseif method == "ScreenPointToRay" or method == "ViewportPointToRay" then
             local c = ws.CurrentCamera
-            if self == c and proj_casting and not caller_is_engine() then
+            if self == c and not caller_is_engine() then
                 local pos = proj_target_pos()
                 if pos then
                     local origin = c.CFrame.Position
@@ -901,7 +934,7 @@ do
                 end
             end
         elseif method == "Raycast" then
-            if self == ws and proj_casting and not caller_is_engine() then
+            if self == ws and not caller_is_engine() then
                 local args = { ... }
                 local origin, direction = args[1], args[2]
                 if typeof(origin) == "Vector3" and typeof(direction) == "Vector3" and direction.Magnitude > 0 then
@@ -911,22 +944,35 @@ do
                         local tt_len = to_target.Magnitude
                         if tt_len > 0.001 then
                             local tt_unit = to_target.Unit
-                            local ray_unit = direction.Unit
-                            if tt_unit:Dot(ray_unit) > 0.985 and direction.Magnitude >= tt_len * 0.9 then
-                                return {
-                                    Position = pos,
-                                    Instance = part,
-                                    Normal = -ray_unit,
-                                    Material = Enum.Material.Plastic,
-                                    Distance = tt_len,
-                                }
-                            end
+                            local hit_dist = math.min(tt_len, direction.Magnitude)
+                            return {
+                                Position = (tt_len <= direction.Magnitude) and pos or (origin + tt_unit * hit_dist),
+                                Instance = part,
+                                Normal = -tt_unit,
+                                Material = Enum.Material.Plastic,
+                                Distance = hit_dist,
+                            }
                         end
                     end
                 end
             end
         end
         return old_namecall(self, ...)
+    end)
+
+    local old_index
+    old_index = hookmetamethod(game, "__index", function(self, k)
+        if mob.on and k == "Position" and typeof(self) == "Instance" then
+            if self:IsA("InputObject") and self.UserInputType == Enum.UserInputType.Touch then
+                if self.UserInputState == Enum.UserInputState.Begin and not caller_is_engine() and not mob.touch_over_ui then
+                    local _, _, gx, gy = get_spoof_screen_pos()
+                    if gx and gy then
+                        return Vector3.new(gx, gy, 0)
+                    end
+                end
+            end
+        end
+        return old_index(self, k)
     end)
 end
 
@@ -2338,36 +2384,61 @@ local function find_hover_target()
     return bn, bc, bh, bn ~= nil
 end
 
-mob.find_center = function()
+mob.is_on_screen = function(hrp)
+    cam = ws.CurrentCamera
+    if not (cam and hrp) then return false, Vector2.zero end
+    local vp = cam.ViewportSize
+    local sp, on_s = cam:WorldToViewportPoint(hrp.Position)
+    if not on_s or sp.Z <= 0 then return false, Vector2.zero end
+    if sp.X < 0 or sp.X > vp.X or sp.Y < 0 or sp.Y > vp.Y then
+        return false, Vector2.zero
+    end
+    return true, Vector2.new(sp.X, sp.Y)
+end
+
+mob.pick_screen_target = function(tap_vp)
     cam = ws.CurrentCamera
     if not cam then return nil, nil, nil, false end
     local vp = cam.ViewportSize
     local center = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
-    local vr = cam:ViewportPointToRay(center.X, center.Y)
-    local ro, rd = vr.Origin, vr.Direction.Unit
+    local ref_pt = tap_vp or mob.last_tap or center
+    local lhrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    local spos = lhrp and lhrp.Position or cam.CFrame.Position
 
-    if resp_barriers then
+    if tap_vp and resp_barriers then
+        local vr = cam:ViewportPointToRay(tap_vp.X, tap_vp.Y)
         m_rp.FilterDescendantsInstances = lp.Character and { lp.Character } or {}
-        local hit = ws:Raycast(ro, rd * 2500, m_rp)
+        local hit = ws:Raycast(vr.Origin, vr.Direction.Unit * 2500, m_rp)
         if hit and hit.Instance then
             for _, p in ipairs(plrs:GetPlayers()) do
                 local ch, hrp = get_char(p)
                 if ch and hrp and hit.Instance:IsDescendantOf(ch) and check_vis(ch, hrp) then
-                    return p.Name, ch, hrp, true
+                    local on_s = mob.is_on_screen(hrp)
+                    if on_s then
+                        return p.Name, ch, hrp, true
+                    end
                 end
             end
         end
     end
 
-    local bn, bc, bh, bd = nil, nil, nil, 14
+    local bn, bc, bh, bs = nil, nil, nil, math.huge
     for _, p in ipairs(plrs:GetPlayers()) do
         local ch, hrp = get_char(p)
         if ch and hrp and check_vis(ch, hrp) then
-            local proj = (hrp.Position - ro):Dot(rd)
-            if proj > 0 and proj <= 1000 then
-                local d = (hrp.Position - (ro + rd * proj)).Magnitude
-                if d < bd then
-                    bd, bn, bc, bh = d, p.Name, ch, hrp
+            local on_s, sp2 = mob.is_on_screen(hrp)
+            if on_s then
+                local ds = (hrp.Position - spos).Magnitude
+                if ds <= 250 then
+                    local tap_d = (sp2 - ref_pt).Magnitude
+                    local cen_d = (sp2 - center).Magnitude
+                    local scr = (tap_d * 0.55) + (cen_d * 0.15) + (ds * 0.30)
+                    if mob.tap_tgt == p.Name and not tap_vp then
+                        scr = scr * 0.85
+                    end
+                    if scr < bs then
+                        bs, bn, bc, bh = scr, p.Name, ch, hrp
+                    end
                 end
             end
         end
@@ -2383,24 +2454,23 @@ local function find_target()
             if ch and hrp then return p.Name, ch, hrp, check_vis(ch, hrp) end
             return nil, nil, nil, false
         end
-        if mob.lock then
-            if mob.tgt then
-                local p = plrs:FindFirstChild(mob.tgt)
-                local ch, hrp = get_char(p)
-                if ch and hrp then
-                    mob.ch, mob.hrp = ch, hrp
-                    return mob.tgt, ch, hrp, check_vis(ch, hrp)
-                else
-                    mob.tgt, mob.ch, mob.hrp = nil, nil, nil
+        if mob.tap_tgt then
+            local p = plrs:FindFirstChild(mob.tap_tgt)
+            local ch, hrp = get_char(p)
+            if ch and hrp and check_vis(ch, hrp) then
+                local on_s = mob.is_on_screen(hrp)
+                if on_s then
+                    mob.tgt, mob.ch, mob.hrp = mob.tap_tgt, ch, hrp
+                    return mob.tap_tgt, ch, hrp, true
                 end
             end
-            local bn, bc, bh, ok_l = mob.find_center()
-            if bn and bc and bh then
-                mob.tgt, mob.ch, mob.hrp = bn, bc, bh
-            end
-            return bn, bc, bh, ok_l
+            mob.tap_tgt, mob.tgt, mob.ch, mob.hrp = nil, nil, nil, nil
         end
-        return nil, nil, nil, false
+        local bn, bc, bh, ok_l = mob.pick_screen_target(nil)
+        if bn and bc and bh then
+            mob.tap_tgt, mob.tgt, mob.ch, mob.hrp = bn, bn, bc, bh
+        end
+        return bn, bc, bh, ok_l
     end
     if sel_plr and sel_plr ~= "None" then return find_hover_target() end
     cam = ws.CurrentCamera
@@ -2436,19 +2506,30 @@ local function find_target()
     return bn, bc, bh, bn ~= nil
 end
 
-local function over_ui_or_prompt()
+local function over_ui_or_prompt(gui_pos)
     if uis:GetFocusedTextBox() then return true end
-    local mp = uis:GetMouseLocation()
-    local inset = gui_svc:GetGuiInset()
-    local gx, gy = mp.X - inset.X, mp.Y - inset.Y
+    local gx, gy
+    if gui_pos then
+        gx, gy = gui_pos.X, gui_pos.Y
+    else
+        local mp = uis:GetMouseLocation()
+        local inset = gui_svc:GetGuiInset()
+        gx, gy = mp.X - inset.X, mp.Y - inset.Y
+    end
 
     local pg = lp:FindFirstChild("PlayerGui")
     if pg then
         local ok, objs = pcall(pg.GetGuiObjectsAtPosition, pg, gx, gy)
         if ok and type(objs) == "table" then
             for _, obj in ipairs(objs) do
-                if obj.Visible and (obj:IsA("GuiButton") or obj:IsA("TextBox")) then
-                    return true
+                if obj.Visible then
+                    if obj:IsA("GuiButton") or obj:IsA("TextBox") then
+                        return true
+                    end
+                    local tg = pg:FindFirstChild("TouchGui")
+                    if tg and obj:IsDescendantOf(tg) and obj.Name ~= "TouchControlFrame" then
+                        return true
+                    end
                 end
             end
         end
@@ -2466,10 +2547,12 @@ local function over_ui_or_prompt()
         end
     end
 
-    local raw_t = MOUSE_HOLDER.r.Target
-    if raw_t and (raw_t:FindFirstChildOfClass("ClickDetector") or raw_t:FindFirstChildOfClass("ProximityPrompt")
-        or (raw_t.Parent and (raw_t.Parent:FindFirstChildOfClass("ClickDetector") or raw_t.Parent:FindFirstChildOfClass("ProximityPrompt")))) then
-        return true
+    if not mob.on then
+        local raw_t = MOUSE_HOLDER.r.Target
+        if raw_t and (raw_t:FindFirstChildOfClass("ClickDetector") or raw_t:FindFirstChildOfClass("ProximityPrompt")
+            or (raw_t.Parent and (raw_t.Parent:FindFirstChildOfClass("ClickDetector") or raw_t.Parent:FindFirstChildOfClass("ProximityPrompt")))) then
+            return true
+        end
     end
     return false
 end
@@ -2483,18 +2566,33 @@ local function unbind_mouse_lock()
     end
 end
 
-local function handle_mouse_input(_, inputState, _)
+local function handle_mouse_input(_, inputState, inputObj)
     if unloaded then
         pcall(function() cas:UnbindAction(ACTION_NAME) end)
         return Enum.ContextActionResult.Pass
     end
-    if over_ui_or_prompt() then
+    local pos_arg = (mob.on and inputObj and inputObj.Position) or nil
+    if over_ui_or_prompt(pos_arg) then
+        if mob.on then mob.touch_over_ui = true end
         return Enum.ContextActionResult.Pass
     end
+    if mob.on then mob.touch_over_ui = false end
 
     if inputState == Enum.UserInputState.Begin then
-        local t = (sel_plr ~= "None" and sel_plr) or cur_tgt
-        if t and t ~= "None" and not is_spawn_protected(t) and spawned and hb_on and proj_on and ign_proj then
+        if mob.on and inputObj and inputObj.Position then
+            local inset = gui_svc:GetGuiInset()
+            local tvp = Vector2.new(inputObj.Position.X + inset.X, inputObj.Position.Y + inset.Y)
+            mob.last_tap = tvp
+            mob.last_tap_t = os.clock()
+            local bn, bc, bh = mob.pick_screen_target(tvp)
+            if bn and bc and bh then
+                mob.tap_tgt, mob.tgt, mob.ch, mob.hrp = bn, bn, bc, bh
+                cur_tgt, cur_tgt_ch, cur_tgt_hrp = bn, bc, bh
+            end
+        end
+        local t = (sel_plr ~= "None" and sel_plr) or (mob.on and mob.tap_tgt) or cur_tgt
+        if t and t ~= "None" and not is_spawn_protected(t) and spawned and hb_on and proj_on then
+            if mob.on then mob.cast_spoof_until = os.clock() + 0.35 end
             task.spawn(function()
                 cast_proj(t, 1)
             end)
@@ -2506,6 +2604,7 @@ local function handle_mouse_input(_, inputState, _)
 end
 
 local function bind_mouse_lock()
+    if mob.on then return end
     if not unloaded and not exclusive_bound then
         exclusive_bound = true
         cas:BindActionAtPriority(
@@ -2540,12 +2639,7 @@ end
 
 local function clr_all()
     cur_tgt, cur_tgt_ch, cur_tgt_hrp = nil, nil, nil
-    if not hb_on then
-        mob.lock = false
-        mob.tgt, mob.ch, mob.hrp = nil, nil, nil
-    elseif not mob.lock then
-        mob.tgt, mob.ch, mob.hrp = nil, nil, nil
-    end
+    mob.tap_tgt, mob.tgt, mob.ch, mob.hrp = nil, nil, nil, nil
     if mob.bbg then mob.bbg.Enabled = false; mob.bbg.Adornee = nil end
     if mob.out_c then mob.out_c.Visible = false end
     clr_hl()
@@ -3329,36 +3423,22 @@ win._on_dd = function(s)
     osp_acc = 1
 end
 mob.lock_dd = tab:CreateDropdown({ Name = "Target Lock", name = "Target Lock", MultipleOptions = false, multiSelect = false, Options = {"None"}, options = {"None"}, CurrentOption = {"None"}, value = {"None"}, Callback = win._on_dd, callback = win._on_dd })
-do
-    local lock_desc = mob.on and "Locks both Outspammer & Aim Lock to the desired player" or "Locks both Outspammer & Aim Assist to the desired player"
-    tab:CreateText({ Text = lock_desc, text = lock_desc })
-end
+tab:CreateText({ Text = "Locks both Outspammer & Aim Assist to the desired player", text = "Locks both Outspammer & Aim Assist to the desired player" })
 
-do
-    local aim_label = mob.on and "Aim Lock" or "Aim Assist"
-    tab:CreateDivider({ text = aim_label })
-    tab:CreateToggle({ Name = aim_label, name = aim_label, CurrentValue = false, value = false,
-        Callback = function(v)
-            hb_on = v
-            if not v then
-                mob.lock = false
-                mob.tgt, mob.ch, mob.hrp = nil, nil, nil
-                clr_all()
-            end
-            if mob.aim_btn then mob.aim_btn.Visible = (mob.on and v) end
-            if mob.upd then mob.upd() end
-        end,
-        callback = function(v)
-            hb_on = v
-            if not v then
-                mob.lock = false
-                mob.tgt, mob.ch, mob.hrp = nil, nil, nil
-                clr_all()
-            end
-            if mob.aim_btn then mob.aim_btn.Visible = (mob.on and v) end
-            if mob.upd then mob.upd() end
-        end })
-end
+tab:CreateDivider({ text = "Aim Assist" })
+tab:CreateToggle({ Name = "Aim Assist", name = "Aim Assist", CurrentValue = false, value = false,
+    Callback = function(v)
+        hb_on = v
+        if not v then
+            clr_all()
+        end
+    end,
+    callback = function(v)
+        hb_on = v
+        if not v then
+            clr_all()
+        end
+    end })
 
 if mob.on then (function()
     mob.sg = Instance.new("ScreenGui", gui_parent())
@@ -3423,35 +3503,8 @@ if mob.on then (function()
         return btn, st
     end
 
-    local aim_st, ping_st, priv_st
-    mob.aim_btn, aim_st = make_circle_btn("Aim Lock", UDim2.new(1, -90, 0.38, 0), function()
-        if not hb_on then return end
-        mob.lock = not mob.lock
-        if mob.lock then
-            mob.tgt, mob.ch, mob.hrp = nil, nil, nil
-            if spawned then
-                if sel_plr and sel_plr ~= "None" then
-                    local p = plrs:FindFirstChild(sel_plr)
-                    local ch, hrp = get_char(p)
-                    if ch and hrp then
-                        mob.tgt, mob.ch, mob.hrp = sel_plr, ch, hrp
-                    end
-                else
-                    local bn, bc, bh = mob.find_center()
-                    if bn and bc and bh then
-                        mob.tgt, mob.ch, mob.hrp = bn, bc, bh
-                    end
-                end
-            end
-        else
-            mob.tgt, mob.ch, mob.hrp = nil, nil, nil
-            clr_all()
-        end
-        if mob.upd then mob.upd() end
-    end)
-    mob.aim_btn.Visible = false
-
-    mob.ping_btn, ping_st = make_circle_btn("Pingless", UDim2.new(1, -90, 0.51, 0), function()
+    local ping_st, priv_st
+    mob.ping_btn, ping_st = make_circle_btn("Pingless", UDim2.new(1, -90, 0.50, 0), function()
         local next_state = not spam_on
         if next_state and priv_spam_on then
             priv_spam_on = false
@@ -3462,7 +3515,7 @@ if mob.on then (function()
         if mob.upd then mob.upd() end
     end)
 
-    mob.priv_btn, priv_st = make_circle_btn("Private", UDim2.new(1, -90, 0.64, 0), function()
+    mob.priv_btn, priv_st = make_circle_btn("Private", UDim2.new(1, -90, 0.63, 0), function()
         local next_state = not priv_spam_on
         if next_state and spam_on then
             spam_on = false
@@ -3474,11 +3527,6 @@ if mob.on then (function()
     end)
 
     mob.upd = function()
-        if mob.aim_btn and aim_st then
-            mob.aim_btn.Text = "Aim Lock\n" .. (mob.lock and "ON" or "OFF")
-            mob.aim_btn.BackgroundColor3 = mob.lock and Color3.fromRGB(45, 125, 75) or Color3.fromRGB(22, 24, 32)
-            aim_st.Color = mob.lock and Color3.fromRGB(115, 235, 155) or Color3.fromRGB(70, 76, 92)
-        end
         if mob.ping_btn and ping_st then
             mob.ping_btn.Text = "Pingless\n" .. (spam_on and "ON" or "OFF")
             mob.ping_btn.BackgroundColor3 = spam_on and Color3.fromRGB(45, 125, 75) or Color3.fromRGB(22, 24, 32)
@@ -3639,38 +3687,7 @@ win._fast_step = function()
     end
 end
 
-add_conn(run.RenderStepped:Connect(function()
-    if unloaded then return end
-    if mob.on and spawned and hb_on and mob.lock and int_on then
-        local lock_name = (sel_plr and sel_plr ~= "None" and sel_plr) or mob.tgt
-        if not lock_name or lock_name == "None" then
-            local bn, bc, bh = mob.find_center()
-            if bn and bc and bh then
-                mob.tgt, mob.ch, mob.hrp = bn, bc, bh
-                lock_name = bn
-            end
-        end
-        if lock_name and lock_name ~= "None" then
-            local p = plrs:FindFirstChild(lock_name)
-            local ch, hrp = get_char(p)
-            if ch and hrp then
-                cam = ws.CurrentCamera
-                if cam then
-                    local cam_pos = cam.CFrame.Position
-                    local tgt_pos = hrp.Position
-                    if (tgt_pos - cam_pos).Magnitude > 0.1 then
-                        cam.CFrame = CFrame.lookAt(cam_pos, tgt_pos)
-                    end
-                end
-            else
-                if lock_name == mob.tgt then
-                    mob.tgt, mob.ch, mob.hrp = nil, nil, nil
-                end
-            end
-        end
-    end
-    win._fast_step()
-end))
+add_conn(run.RenderStepped:Connect(win._fast_step))
 add_conn(run.Stepped:Connect(win._fast_step))
 
 add_conn(run.Heartbeat:Connect(function()
@@ -3787,13 +3804,48 @@ add_conn(run.Heartbeat:Connect(function()
 end))
 
 add_conn(uis.InputBegan:Connect(function(inp, gp)
-    if unloaded or gp or inp.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
-    if over_ui_or_prompt() then return end
-    if spawned and hb_on and int_on and cur_tgt and not proj_on and not is_self_blocked() and not is_spawn_protected(cur_tgt) then
+    if unloaded then return end
+    local is_touch = (inp.UserInputType == Enum.UserInputType.Touch)
+    local is_click = (inp.UserInputType == Enum.UserInputType.MouseButton1)
+    if mob.on then
+        if not is_touch then return end
+        if gp or over_ui_or_prompt(inp.Position) then
+            mob.touch_over_ui = true
+            return
+        end
+        mob.touch_over_ui = false
+        local inset = gui_svc:GetGuiInset()
+        local tvp = Vector2.new(inp.Position.X + inset.X, inp.Position.Y + inset.Y)
+        mob.last_tap = tvp
+        mob.last_tap_t = os.clock()
+        mob.cast_spoof_until = os.clock() + 0.18
+        if spawned and hb_on and (not sel_plr or sel_plr == "None") then
+            local bn, bc, bh = mob.pick_screen_target(tvp)
+            if bn and bc and bh then
+                mob.tap_tgt, mob.tgt, mob.ch, mob.hrp = bn, bn, bc, bh
+                cur_tgt, cur_tgt_ch, cur_tgt_hrp = bn, bc, bh
+                local h_cur = ability_hdl and rawget(ability_hdl, "activeAbility")
+                if type(h_cur) == "table" then
+                    write_target_on(h_cur)
+                end
+            end
+        end
+    else
+        if gp or not is_click then return end
+        if over_ui_or_prompt() then return end
+    end
+
+    local active_t = (sel_plr ~= "None" and sel_plr) or (mob.on and mob.tap_tgt) or cur_tgt
+    if mob.on and spawned and hb_on and int_on and proj_on and ign_proj and active_t and active_t ~= "None" and not is_spawn_protected(active_t) then
+        task.spawn(function()
+            cast_proj(active_t, 1)
+        end)
+    end
+    if spawned and hb_on and int_on and active_t and not proj_on and not is_self_blocked() and not is_spawn_protected(active_t) then
         local h = ability_hdl and rawget(ability_hdl, "activeAbility")
         local nm = type(h) == "table" and rawget(h, "_name") or nil
-        if not is_ability_on_cooldown(nm) and not is_target_blocked(cur_tgt, h, nm, false) then
-            local t = cur_tgt
+        if not is_ability_on_cooldown(nm) and not is_target_blocked(active_t, h, nm, false) then
+            local t = active_t
             local ch, hrp = get_char(plrs:FindFirstChild(t))
             if ch and hrp and is_within_strict_spam_range(nm, cur_eq_id, hrp) then
                 local click_burst = math.clamp(math.ceil(cps / 60), 1, 35)
